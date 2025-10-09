@@ -218,18 +218,18 @@ func TestGetVPCIPv4CIDRBlocks(t *testing.T) {
 
 }
 
-// func TestGetSubnetIPv6CIDRBlocks(t *testing.T) {
-// 	f := TypedIMDS{FakeIMDS(map[string]interface{}{
-// 		"network/interfaces/macs/02:c5:f8:3e:6b:27/subnet-ipv6-cidr-blocks": "2001:db8::/56",
-// 	})}
+func TestGetSubnetIPv6CIDRBlocks(t *testing.T) {
+	f := TypedIMDS{FakeIMDS(map[string]interface{}{
+		"network/interfaces/macs/02:c5:f8:3e:6b:27/subnet-ipv6-cidr-blocks": "2001:db8::/56",
+	})}
 
-// 	ips, err := f.GetSubnetIPv6CIDRBlocks(context.TODO(), "02:c5:f8:3e:6b:27")
-// 	if assert.NoError(t, err) {
-// 		assert.Equal(t, ips,
-// 			net.IPNet{IP: net.IP{0x20, 0x1, 0xd, 0xb8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
-// 				Mask: net.IPMask{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}})
-// 	}
-// }
+	ips, err := f.GetSubnetIPv6CIDRBlocks(context.TODO(), "02:c5:f8:3e:6b:27")
+	if assert.NoError(t, err) {
+		assert.Equal(t, ips,
+			net.IPNet{IP: net.IP{0x20, 0x1, 0xd, 0xb8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+				Mask: net.IPMask{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}})
+	}
+}
 
 func TestGetVPCIPv6CIDRBlocks(t *testing.T) {
 	f := TypedIMDS{FakeIMDS(map[string]interface{}{
