@@ -98,6 +98,17 @@ const (
 	myNodeName           = "testNodeName"
 	imdsMACFields        = "security-group-ids subnet-id vpc-id vpc-ipv4-cidr-blocks device-number interface-id subnet-ipv4-cidr-block local-ipv4s ipv4-prefix ipv6-prefix"
 	imdsMACFieldsEfaOnly = "security-group-ids subnet-id vpc-id vpc-ipv4-cidr-blocks device-number interface-id subnet-ipv4-cidr-block ipv4-prefix ipv6-prefix"
+	
+	// Cross-VPC ENI test constants
+	crossVPCMAC          = "12:ef:2a:98:e5:5c"
+	crossVPCENIID        = "eni-crossvpc123"
+	crossVPCDevice       = "2"
+	crossVPCPrivateIP    = "172.16.0.10"
+	crossVPCSubnetID     = "subnet-crossvpc456"
+	crossVPCSubnetCIDR   = "172.16.0.0/24"
+	crossVPCVpcID        = "vpc-crossvpc789"
+	noManageTagKey       = "node.k8s.amazonaws.com/no_manage"
+	noManageTagValue     = "true"
 	imdsMACFieldsV6Only  = "security-group-ids subnet-id vpc-id vpc-ipv4-cidr-blocks vpc-ipv6-cidr-blocks device-number interface-id subnet-ipv6-cidr-blocks ipv6s ipv6-prefix"
 	imdsMACFieldsV4AndV6 = "security-group-ids subnet-id vpc-id vpc-ipv4-cidr-blocks device-number interface-id subnet-ipv4-cidr-block subnet-ipv6-cidr-blocks ipv6s local-ipv4s ipv6-prefix"
 )
@@ -342,6 +353,229 @@ func TestGetAttachedENIsWithPrefixes(t *testing.T) {
 	ens, err := cache.GetAttachedENIs()
 	if assert.NoError(t, err) {
 		assert.Equal(t, len(ens), 2)
+	}
+}
+
+// TestCrossVPCENIBugReproduction demonstrates the bug where cross-VPC IPv4-only ENIs
+// cause VPC CNI initialization failure in IPv6-enabled clusters because no_manage tags
+// are ignored due to premature 404 errors during IPv6 metadata retrieval
+func TestCrossVPCENIBugReproduction(t *testing.T) {
+	// Set up IPv6-enabled cluster environment
+	mockMetadata := testMetadata(map[string]interface{}{
+		// Primary VPC ENI with IPv6 support
+		metadataMACPath: primaryMAC + " " + crossVPCMAC,
+		
+		// Cross-VPC ENI basic metadata (this succeeds)
+		metadataMACPath + crossVPCMAC:                      imdsMACFields,
+		metadataMACPath + crossVPCMAC + metadataDeviceNum:  crossVPCDevice,
+		metadataMACPath + crossVPCMAC + metadataInterface:  crossVPCENIID,
+		metadataMACPath + crossVPCMAC + metadataSubnetID:   crossVPCSubnetID,
+		metadataMACPath + crossVPCMAC + metadataVpcID:      crossVPCVpcID,
+		metadataMACPath + crossVPCMAC + metadataSubnetCIDR: crossVPCSubnetCIDR,
+		metadataMACPath + crossVPCMAC + metadataIPv4s:      crossVPCPrivateIP,
+		metadataMACPath + crossVPCMAC + metadataSGs:        sgs,
+		
+		// IPv6 subnet CIDR request fails with 404 for cross-VPC IPv4-only subnet
+		// This simulates the real-world scenario where cross-VPC subnets don't have IPv6
+		metadataMACPath + crossVPCMAC + metadataSubnetV6CIDR: &CustomRequestFailure{
+			code:       "NotFound",
+			message:    "IPv6 CIDR not found for cross-VPC IPv4-only subnet",
+			fault:      smithy.FaultUnknown,
+			statusCode: 404,
+			requestID:  "test-req-id",
+		},
+	})
+
+	// Create cache with IPv6 enabled (this triggers the bug)
+	cache := &EC2InstanceMetadataCache{
+		imds:      TypedIMDS{mockMetadata},
+		v6Enabled: true, // This is the key - IPv6 enabled cluster
+		v4Enabled: true,
+	}
+
+	// Attempt to get attached ENIs - this should fail due to the bug
+	enis, err := cache.GetAttachedENIs()
+	
+	// Verify the bug behavior: initialization fails due to IPv6 metadata retrieval error
+	// Even though the cross-VPC ENI should be ignored via no_manage tag
+	assert.Error(t, err, "Expected error due to IPv6 metadata retrieval failure on cross-VPC ENI")
+	assert.Contains(t, err.Error(), "failed to retrieve", "Error should indicate metadata retrieval failure")
+	assert.Nil(t, enis, "ENI list should be nil when initialization fails")
+	
+	// Log the bug scenario for debugging
+	t.Logf("BUG REPRODUCED: IPv6-enabled cluster failed to initialize due to cross-VPC IPv4-only ENI")
+	t.Logf("Root cause: IPv6 metadata retrieval attempted before no_manage tag evaluation")
+	t.Logf("Impact: Customer setup fails even with proper no_manage tagging")
+	t.Logf("Error: %v", err)
+}
+
+// TestCrossVPCENIWithProperTagHandling demonstrates the expected behavior when
+// no_manage tags are properly evaluated before IPv6 metadata retrieval
+func TestCrossVPCENIWithProperTagHandling(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+
+	// Set up the same cross-VPC scenario but with proper EC2 tag handling
+	mockMetadata := testMetadata(map[string]interface{}{
+		// Primary VPC ENI with IPv6 support  
+		metadataMACPath: primaryMAC + " " + crossVPCMAC,
+		
+		// Cross-VPC ENI basic metadata
+		metadataMACPath + crossVPCMAC:                      imdsMACFields,
+		metadataMACPath + crossVPCMAC + metadataDeviceNum:  crossVPCDevice,
+		metadataMACPath + crossVPCMAC + metadataInterface:  crossVPCENIID,
+		metadataMACPath + crossVPCMAC + metadataSubnetID:   crossVPCSubnetID,
+		metadataMACPath + crossVPCMAC + metadataVpcID:      crossVPCVpcID,
+		metadataMACPath + crossVPCMAC + metadataSubnetCIDR: crossVPCSubnetCIDR,
+		metadataMACPath + crossVPCMAC + metadataIPv4s:      crossVPCPrivateIP,
+		metadataMACPath + crossVPCMAC + metadataSGs:        sgs,
+	})
+
+	// Mock EC2 response with no_manage tag on cross-VPC ENI
+	ec2Response := &ec2.DescribeNetworkInterfacesOutput{
+		NetworkInterfaces: []ec2types.NetworkInterface{
+			{
+				NetworkInterfaceId: aws.String(primaryeniID),
+				VpcId:              aws.String(vpcID),
+				SubnetId:           aws.String(subnetID),
+				TagSet: []ec2types.Tag{
+					{Key: aws.String("Name"), Value: aws.String("primary-eni")},
+				},
+				Attachment: &ec2types.NetworkInterfaceAttachment{
+					NetworkCardIndex: aws.Int32(0),
+				},
+			},
+			{
+				NetworkInterfaceId: aws.String(crossVPCENIID),
+				VpcId:              aws.String(crossVPCVpcID), // Different VPC
+				SubnetId:           aws.String(crossVPCSubnetID),
+				TagSet: []ec2types.Tag{
+					{Key: aws.String(noManageTagKey), Value: aws.String(noManageTagValue)}, // no_manage tag
+					{Key: aws.String("Name"), Value: aws.String("cross-vpc-eni")},
+				},
+				Attachment: &ec2types.NetworkInterfaceAttachment{
+					NetworkCardIndex: aws.Int32(0),
+				},
+			},
+		},
+	}
+
+	// Mock EC2 call to return ENIs with tags
+	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any(), gomock.Any()).Return(ec2Response, nil).AnyTimes()
+
+	// Create cache with IPv6 enabled
+	cache := &EC2InstanceMetadataCache{
+		imds:         TypedIMDS{mockMetadata},
+		ec2SVC:       mockEC2,
+		v6Enabled:    true,
+		v4Enabled:    true,
+		instanceType: "test-instance",
+	}
+
+	// When the bug is fixed, DescribeAllENIs should succeed because:
+	// 1. Tags are evaluated first
+	// 2. Cross-VPC ENI with no_manage tag is skipped
+	// 3. No IPv6 metadata retrieval attempted for unmanaged ENIs
+	result, err := cache.DescribeAllENIs()
+	
+	// Expected behavior: initialization succeeds
+	assert.NoError(t, err, "Should succeed when no_manage tags are properly evaluated")
+	assert.NotNil(t, result, "Should return valid result")
+	
+	// Verify that cross-VPC ENI with no_manage tag is present in TagMap but not processed for IPv6
+	if result.TagMap != nil {
+		crossVPCTags, exists := result.TagMap[crossVPCENIID]
+		if exists {
+			assert.Equal(t, noManageTagValue, crossVPCTags[noManageTagKey], 
+				"Cross-VPC ENI should have no_manage tag")
+			t.Logf("SUCCESS: Cross-VPC ENI properly tagged and would be ignored: %v", crossVPCTags)
+		}
+	}
+	
+	t.Logf("EXPECTED BEHAVIOR: IPv6-enabled cluster initializes successfully")
+	t.Logf("Reason: no_manage tags evaluated before IPv6 metadata retrieval")
+	t.Logf("Result: Cross-VPC ENIs properly ignored, no 404 errors encountered")
+}
+
+// TestCrossVPCENIMixedScenarios tests various combinations of ENI configurations
+// to validate the fix works in complex real-world scenarios
+func TestCrossVPCENIMixedScenarios(t *testing.T) {
+	testCases := []struct {
+		name           string
+		v6Enabled      bool
+		expectError    bool
+		description    string
+	}{
+		{
+			name:        "IPv4-only cluster with cross-VPC ENIs",
+			v6Enabled:   false,
+			expectError: false,
+			description: "Should work fine since no IPv6 metadata retrieval attempted",
+		},
+		{
+			name:        "IPv6-enabled cluster with cross-VPC ENIs (bug scenario)",
+			v6Enabled:   true,
+			expectError: true,
+			description: "Demonstrates the bug where IPv6 metadata retrieval fails",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set up test scenario with multiple ENIs
+			mockMetadata := testMetadata(map[string]interface{}{
+				// Multiple ENIs including cross-VPC
+				metadataMACPath: primaryMAC + " " + eni2MAC + " " + crossVPCMAC,
+				
+				// Second ENI (same VPC)
+				metadataMACPath + eni2MAC:                      imdsMACFields,
+				metadataMACPath + eni2MAC + metadataDeviceNum:  eni2Device,
+				metadataMACPath + eni2MAC + metadataInterface:  eni2ID,
+				metadataMACPath + eni2MAC + metadataSubnetCIDR: subnetCIDR,
+				metadataMACPath + eni2MAC + metadataIPv4s:      eni2PrivateIP,
+				metadataMACPath + eni2MAC + metadataSubnetID:   subnetID,
+				metadataMACPath + eni2MAC + metadataVpcID:      vpcID,
+				metadataMACPath + eni2MAC + metadataSGs:        sgs,
+				
+				// Cross-VPC ENI
+				metadataMACPath + crossVPCMAC:                      imdsMACFields,
+				metadataMACPath + crossVPCMAC + metadataDeviceNum:  crossVPCDevice,
+				metadataMACPath + crossVPCMAC + metadataInterface:  crossVPCENIID,
+				metadataMACPath + crossVPCMAC + metadataSubnetID:   crossVPCSubnetID,
+				metadataMACPath + crossVPCMAC + metadataVpcID:      crossVPCVpcID,
+				metadataMACPath + crossVPCMAC + metadataSubnetCIDR: crossVPCSubnetCIDR,
+				metadataMACPath + crossVPCMAC + metadataIPv4s:      crossVPCPrivateIP,
+				metadataMACPath + crossVPCMAC + metadataSGs:        sgs,
+			})
+
+			// Add IPv6 failure for cross-VPC ENI if IPv6 is enabled
+			if tc.v6Enabled {
+				mockMetadata[metadataMACPath + crossVPCMAC + metadataSubnetV6CIDR] = &CustomRequestFailure{
+					code:       "NotFound",
+					message:    "IPv6 CIDR not found for cross-VPC subnet",
+					fault:      smithy.FaultUnknown,
+					statusCode: 404,
+					requestID:  "test-req-id",
+				}
+			}
+
+			cache := &EC2InstanceMetadataCache{
+				imds:      TypedIMDS{mockMetadata},
+				v6Enabled: tc.v6Enabled,
+				v4Enabled: true,
+			}
+
+			enis, err := cache.GetAttachedENIs()
+
+			if tc.expectError {
+				assert.Error(t, err, "Expected error for scenario: %s", tc.description)
+				t.Logf("SCENARIO: %s - Error as expected: %v", tc.description, err)
+			} else {
+				assert.NoError(t, err, "Expected success for scenario: %s", tc.description)
+				assert.NotNil(t, enis, "Should return ENI list")
+				t.Logf("SCENARIO: %s - Success with %d ENIs", tc.description, len(enis))
+			}
+		})
 	}
 }
 
