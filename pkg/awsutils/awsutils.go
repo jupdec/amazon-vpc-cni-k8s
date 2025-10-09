@@ -726,28 +726,28 @@ func (cache *EC2InstanceMetadataCache) getENIMetadata(eniMAC string) (ENIMetadat
 
 	var ec2ip6s []ec2types.NetworkInterfaceIpv6Address
 	var subnetV6Cidr string
-	if cache.v6Enabled {
-		// For IPv6 ENIs, we have to return the error if Subnet is not discovered
-		v6cidr, err := cache.imds.GetSubnetIPv6CIDRBlocks(ctx, eniMAC)
-		if err != nil {
-			awsAPIErrInc("GetSubnetIPv6CIDRBlocks", err)
-			return ENIMetadata{}, err
-		} else {
-			subnetV6Cidr = v6cidr.String()
-		}
+	// if cache.v6Enabled {
+	// 	// For IPv6 ENIs, we have to return the error if Subnet is not discovered
+	// 	v6cidr, err := cache.imds.GetSubnetIPv6CIDRBlocks(ctx, eniMAC)
+	// 	if err != nil {
+	// 		awsAPIErrInc("GetSubnetIPv6CIDRBlocks", err)
+	// 		return ENIMetadata{}, err
+	// 	} else {
+	// 		subnetV6Cidr = v6cidr.String()
+	// 	}
 
-		imdsIPv6s, err := cache.imds.GetIPv6s(ctx, eniMAC)
-		if err != nil {
-			awsAPIErrInc("GetIPv6s", err)
-		} else {
-			ec2ip6s = make([]ec2types.NetworkInterfaceIpv6Address, len(imdsIPv6s))
-			for i, ip6 := range imdsIPv6s {
-				ec2ip6s[i] = ec2types.NetworkInterfaceIpv6Address{
-					Ipv6Address: aws.String(ip6.String()),
-				}
-			}
-		}
-	}
+	// 	imdsIPv6s, err := cache.imds.GetIPv6s(ctx, eniMAC)
+	// 	if err != nil {
+	// 		awsAPIErrInc("GetIPv6s", err)
+	// 	} else {
+	// 		ec2ip6s = make([]ec2types.NetworkInterfaceIpv6Address, len(imdsIPv6s))
+	// 		for i, ip6 := range imdsIPv6s {
+	// 			ec2ip6s[i] = ec2types.NetworkInterfaceIpv6Address{
+	// 				Ipv6Address: aws.String(ip6.String()),
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	var ec2ipv4Prefixes []ec2types.Ipv4PrefixSpecification
 	var ec2ipv6Prefixes []ec2types.Ipv6PrefixSpecification
