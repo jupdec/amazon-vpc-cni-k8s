@@ -736,7 +736,13 @@ func (cache *EC2InstanceMetadataCache) getENIMetadata(eniMAC string) (ENIMetadat
 			awsAPIErrInc("GetSubnetIPv6CIDRBlocks", err)
 			return ENIMetadata{}, err
 		} else {
-			subnetV6Cidr = v6cidr.String()
+			// Handle the case where GetSubnetIPv6CIDRBlocks returns empty IPNet for IPv4-only subnets
+			if v6cidr.IP != nil && v6cidr.Mask != nil {
+				subnetV6Cidr = v6cidr.String()
+			} else {
+				// Empty IPNet indicates IPv4-only subnet (404 handled gracefully)
+				subnetV6Cidr = ""
+			}
 		}
 
 		imdsIPv6s, err := cache.imds.GetIPv6s(ctx, eniMAC)
