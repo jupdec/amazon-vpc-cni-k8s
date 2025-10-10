@@ -2281,7 +2281,8 @@ func Test_IsTrunkingCompatible(t *testing.T) {
 }
 
 
-// TestCrossVPCENIWithFix demonstrates that GetSubnetIPv6CIDRBlocks now handles 404 errors gracefully like other IPv6 functions
+// TestCrossVPCENIWithFix demonstrates that getCIDR now handles 404 errors gracefully,
+// fixing GetSubnetIPv6CIDRBlocks and other CIDR functions for cross-VPC IPv4-only ENIs
 func TestCrossVPCENIWithFix(t *testing.T) {
 	// Set up the same cross-VPC scenario as the bug reproduction test
 	mockMetadata := testMetadata(map[string]interface{}{
@@ -2320,7 +2321,7 @@ func TestCrossVPCENIWithFix(t *testing.T) {
 	enis, err := cache.GetAttachedENIs()
 	
 	// Verify the fix: initialization should now succeed
-	assert.NoError(t, err, "Should succeed with fix - GetSubnetIPv6CIDRBlocks now handles 404 gracefully")
+	assert.NoError(t, err, "Should succeed with fix - getCIDR now handles 404 gracefully for all CIDR functions")
 	assert.NotNil(t, enis, "Should return ENI list")
 	assert.Equal(t, 2, len(enis), "Should return both primary and cross-VPC ENIs")
 	

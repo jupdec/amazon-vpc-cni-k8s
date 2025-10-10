@@ -415,6 +415,16 @@ func (typedimds TypedIMDS) getCIDR(ctx context.Context, key string) (net.IPNet, 
 	output, err := typedimds.GetMetadata(ctx, &imds.GetMetadataInput{
 		Path: key})
 	if err != nil {
+		imdsErr := new(imdsRequestError)
+		oe := new(smithy.OperationError)
+		if errors.As(err, &imdsErr) || errors.As(err, &oe) {
+			if IsNotFound(err) {
+				// No CIDR found. Not an error for IPv4-only subnets when requesting IPv6 CIDRs
+				return nil, nil
+			}
+			log.Warnf("%v", err)
+			return net.IPNet{}, newIMDSRequestError(err.Error(), err)
+		}
 		return net.IPNet{}, err
 	}
 	if output == nil || output.Content == nil {
@@ -618,21 +628,7 @@ func (typedimds TypedIMDS) GetVPCIPv6CIDRBlocks(ctx context.Context, mac string)
 // GetSubnetIPv6CIDRBlocks returns the IPv6 CIDR block for the subnet in which the interface resides.
 func (typedimds TypedIMDS) GetSubnetIPv6CIDRBlocks(ctx context.Context, mac string) (net.IPNet, error) {
 	key := fmt.Sprintf("network/interfaces/macs/%s/subnet-ipv6-cidr-blocks", mac)
-	cidr, err := typedimds.getCIDR(ctx, key)
-	if err != nil {
-		imdsErr := new(imdsRequestError)
-		oe := new(smithy.OperationError)
-		if errors.As(err, &imdsErr) || errors.As(err, &oe) {
-			if IsNotFound(err) {
-				// No IPv6 subnet CIDR. Not an error for IPv4-only subnets
-				return net.IPNet{}, nil
-			}
-			log.Warnf("%v", err)
-			return net.IPNet{}, newIMDSRequestError(err.Error(), err)
-		}
-		return net.IPNet{}, err
-	}
-	return cidr, err
+    return typedimds.getCIDR(ctx, key)
 }
 
 // GetNetworkCard returns the Network card the interface is attached on
