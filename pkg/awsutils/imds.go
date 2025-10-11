@@ -420,7 +420,7 @@ func (typedimds TypedIMDS) getCIDR(ctx context.Context, key string) (net.IPNet, 
 		if errors.As(err, &imdsErr) || errors.As(err, &oe) {
 			if IsNotFound(err) {
 				// No CIDR found. Not an error for IPv4-only subnets when requesting IPv6 CIDRs
-				return nil, nil
+				return net.IPNet{}, nil
 			}
 			log.Warnf("%v", err)
 			return net.IPNet{}, newIMDSRequestError(err.Error(), err)
