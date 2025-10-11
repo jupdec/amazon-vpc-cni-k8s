@@ -746,7 +746,7 @@ func (cache *EC2InstanceMetadataCache) getENIMetadata(eniMAC string) (ENIMetadat
 			// Handle the case where GetSubnetIPv6CIDRBlocks returns empty IPNet for IPv4-only subnets
 			if v6cidr.IP != nil {
 				subnetV6Cidr = v6cidr.String()
-			} 
+			}
 		}
 
 		imdsIPv6s, err := cache.imds.GetIPv6s(ctx, eniMAC)
@@ -1175,7 +1175,7 @@ func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	// Check for HTTP status code 404
 	type httpStatusCoder interface {
 		HTTPStatusCode() int
@@ -1183,7 +1183,7 @@ func isNotFoundError(err error) bool {
 	if httpErr, ok := err.(httpStatusCoder); ok && httpErr.HTTPStatusCode() == 404 {
 		return true
 	}
-	
+
 	// Check for error code "NotFound"
 	type errorCoder interface {
 		ErrorCode() string
@@ -1191,7 +1191,7 @@ func isNotFoundError(err error) bool {
 	if codeErr, ok := err.(errorCoder); ok && codeErr.ErrorCode() == "NotFound" {
 		return true
 	}
-	
+
 	return false
 }
 

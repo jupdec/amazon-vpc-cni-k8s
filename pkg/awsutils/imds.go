@@ -628,7 +628,7 @@ func (typedimds TypedIMDS) GetVPCIPv6CIDRBlocks(ctx context.Context, mac string)
 // GetSubnetIPv6CIDRBlocks returns the IPv6 CIDR block for the subnet in which the interface resides.
 func (typedimds TypedIMDS) GetSubnetIPv6CIDRBlocks(ctx context.Context, mac string) (net.IPNet, error) {
 	key := fmt.Sprintf("network/interfaces/macs/%s/subnet-ipv6-cidr-blocks", mac)
-    return typedimds.getCIDR(ctx, key)
+	return typedimds.getCIDR(ctx, key)
 }
 
 // GetNetworkCard returns the Network card the interface is attached on
