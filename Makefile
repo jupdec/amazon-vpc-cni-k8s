@@ -129,7 +129,7 @@ MULTI_PLATFORM_BUILD_TARGETS = 	linux/amd64,linux/arm64
 ##@ Building
 
 # Build both CNI and metrics helper container images.
-all: docker docker-init docker-metrics   ## Builds Init, CNI and metrics helper container images.
+all: plugins docker docker-init docker-metrics   ## Builds Init, CNI and metrics helper container images.
 
 dist: all
 	mkdir -p $(DESTDIR)
@@ -167,7 +167,7 @@ docker:	setup-ec2-sdk-override     ## Build VPC CNI plugin & agent container ima
 docker-init:     ## Build VPC CNI plugin Init container image.
 	docker build $(DOCKER_BUILD_FLAGS_CNI_INIT) \
 		-f scripts/dockerfiles/Dockerfile.init \
-		-t "$(INIT_IMAGE_NAME)" \
+		--no-cache -t "$(INIT_IMAGE_NAME)" \
 		.
 	@echo "Built Docker image \"$(INIT_IMAGE_NAME)\""
 
