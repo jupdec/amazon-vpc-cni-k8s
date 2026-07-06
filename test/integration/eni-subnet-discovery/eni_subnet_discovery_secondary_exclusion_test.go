@@ -107,7 +107,7 @@ var _ = Describe("Secondary ENI Exclusion Tests", func() {
 
 				deploymentBuilder := manifest.NewBusyBoxDeploymentBuilder(f.Options.TestImageRegistry).
 					Container(container).
-					Replicas(15). // Enough to force secondary ENI creation
+					Replicas(computeReplicasForBothSubnets(string(primaryInstance.InstanceType))). // Spread pods across primary + secondary subnets
 					PodLabel(secondaryExclusionPodLabelKey, secondaryExclusionPodLabelVal).
 					NodeName(*primaryInstance.PrivateDnsName).
 					Build()
@@ -194,7 +194,9 @@ var _ = Describe("Secondary ENI Exclusion Tests", func() {
 				validateSecondaryENIExclusionInDatastore()
 
 				By("Scaling deployment to test new pod allocation behavior")
-				scaledDeployment := scaleDeployment(initialDeployment, 25) // Add more pods
+				// Scale above the initial both-subnets count so new pods are created; after the
+				// secondary subnet is excluded these new pods must land in the primary subnet.
+				scaledDeployment := scaleDeployment(initialDeployment, computeReplicasForBothSubnets(string(primaryInstance.InstanceType))+2) // Add more pods
 
 				By("Waiting for new pods to be scheduled")
 				time.Sleep(45 * time.Second)
@@ -219,7 +221,7 @@ var _ = Describe("Secondary ENI Exclusion Tests", func() {
 				time.Sleep(30 * time.Second)
 
 				By("Scaling deployment to test prefix delegation with secondary exclusion")
-				scaledDeployment := scaleDeployment(initialDeployment, 20)
+				scaledDeployment := scaleDeployment(initialDeployment, computeReplicasForBothSubnets(string(primaryInstance.InstanceType))+2)
 
 				By("Verifying new pods use primary subnet with prefix delegation")
 				validateNewPodsAvoidExcludedSecondaryENI(scaledDeployment, primarySubnetCIDR, secondarySubnetCIDR)
@@ -231,6 +233,359 @@ var _ = Describe("Secondary ENI Exclusion Tests", func() {
 				k8sUtils.AddEnvVarToDaemonSetAndWaitTillUpdated(f, utils.AwsNodeName, utils.AwsNodeNamespace, utils.AwsNodeName, map[string]string{
 					"ENABLE_PREFIX_DELEGATION": "false",
 				})
+			})
+		})
+
+		Context("when secondary subnet has no cni tag (discovery gating)", func() {
+			var untaggedSubnetID string
+			var untaggedSubnetCIDR *net.IPNet
+			var taggedSubnetID string
+
+			BeforeEach(func() {
+				By("Creating an untagged secondary subnet")
+				untaggedSubnetOutput, err := f.CloudServices.EC2().
+					CreateSubnet(context.TODO(), "100.64.64.0/24", f.Options.AWSVPCID, *primaryInstance.Placement.AvailabilityZone)
+				Expect(err).ToNot(HaveOccurred())
+
+				untaggedSubnetID = *untaggedSubnetOutput.Subnet.SubnetId
+				untaggedSubnetCIDR = getSubnetCIDR(untaggedSubnetID)
+
+				By("Creating another subnet with cni=1 for comparison")
+				taggedSubnetOutput, err := f.CloudServices.EC2().
+					CreateSubnet(context.TODO(), "100.64.65.0/24", f.Options.AWSVPCID, *primaryInstance.Placement.AvailabilityZone)
+				Expect(err).ToNot(HaveOccurred())
+
+				taggedSubnetID = *taggedSubnetOutput.Subnet.SubnetId
+
+				By("Tagging comparison subnet with cni=1")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{taggedSubnetID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("1"),
+							},
+						},
+					)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Restarting aws-node pods to apply subnet discovery")
+				restartAwsNodePods()
+
+				By("Waiting for configuration to take effect")
+				time.Sleep(30 * time.Second)
+			})
+
+			AfterEach(func() {
+				By("Deleting untagged subnet")
+				err := f.CloudServices.EC2().DeleteSubnet(context.TODO(), untaggedSubnetID)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to delete untagged subnet %s: %v\n", untaggedSubnetID, err)
+				}
+
+				By("Deleting tagged comparison subnet")
+				err = f.CloudServices.EC2().DeleteSubnet(context.TODO(), taggedSubnetID)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to delete tagged subnet %s: %v\n", taggedSubnetID, err)
+				}
+			})
+
+			It("should not discover secondary subnet without cni tag", func() {
+				By("Creating deployment that requires secondary ENIs")
+				container := manifest.NewNetCatAlpineContainer(f.Options.TestImageRegistry).
+					Command([]string{"sleep"}).
+					Args([]string{"3600"}).
+					Build()
+
+				deploymentBuilder := manifest.NewBusyBoxDeploymentBuilder(f.Options.TestImageRegistry).
+					Container(container).
+					Replicas(computeReplicasForBothSubnets(string(primaryInstance.InstanceType))). // Overflow onto a secondary ENI so the gating (untagged subnet skipped) is actually exercised
+					PodLabel(secondaryExclusionPodLabelKey, "no-cni-tag-gating").
+					NodeName(*primaryInstance.PrivateDnsName).
+					Build()
+
+				var err error
+				deployment, err := f.K8sResourceManagers.DeploymentManager().
+					CreateAndWaitTillDeploymentIsReady(deploymentBuilder, utils.DefaultDeploymentReadyTimeout)
+				Expect(err).ToNot(HaveOccurred())
+
+				defer func() {
+					By("Cleaning up deployment")
+					err := f.K8sResourceManagers.DeploymentManager().DeleteAndWaitTillDeploymentIsDeleted(deployment)
+					Expect(err).ToNot(HaveOccurred())
+					time.Sleep(60 * time.Second)
+				}()
+
+				By("Verifying no pods are placed in the untagged subnet (gating mechanism works)")
+				pods, err := f.K8sResourceManagers.PodManager().GetPodsWithLabelSelector(secondaryExclusionPodLabelKey, "no-cni-tag-gating")
+				Expect(err).ToNot(HaveOccurred())
+
+				podsInUntaggedSubnet := 0
+				for _, pod := range pods.Items {
+					if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+						podIP := net.ParseIP(pod.Status.PodIP)
+						if untaggedSubnetCIDR.Contains(podIP) {
+							podsInUntaggedSubnet++
+							GinkgoWriter.Printf("ERROR: Pod %s found in untagged subnet %s\n", pod.Name, pod.Status.PodIP)
+						}
+					}
+				}
+
+				Expect(podsInUntaggedSubnet).To(Equal(0),
+					"Secondary subnet without cni tag should be excluded - no pods should be placed there (gating mechanism)")
+			})
+		})
+
+		Context("when secondary subnet has cni=1 with old cluster tag prefix", func() {
+			var secondarySubnetWithOldTagID string
+
+			BeforeEach(func() {
+				By("Creating secondary subnet with cni=1 and old cluster tag prefix")
+				subnetOutput, err := f.CloudServices.EC2().
+					CreateSubnet(context.TODO(), "100.64.66.0/24", f.Options.AWSVPCID, *primaryInstance.Placement.AvailabilityZone)
+				Expect(err).ToNot(HaveOccurred())
+
+				secondarySubnetWithOldTagID = *subnetOutput.Subnet.SubnetId
+
+				By("Tagging test subnet with cni=1 (opt-in) and old-style cluster tag")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{secondarySubnetWithOldTagID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("1"),
+							},
+							{
+								Key:   aws.String("kubernetes.io/cluster/test-cluster"),
+								Value: aws.String("shared"),
+							},
+						},
+					)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Excluding primary subnet with cni=0 to force CNI to use secondary subnets")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{primarySubnetID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("0"),
+							},
+						},
+					)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Also excluding the BeforeSuite secondary subnet so only our test subnet is available")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{secondarySubnetID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("0"),
+							},
+						},
+					)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Setting WARM_ENI_TARGET=2 to force secondary ENI creation")
+				k8sUtils.AddEnvVarToDaemonSetAndWaitTillUpdated(f, utils.AwsNodeName, utils.AwsNodeNamespace,
+					utils.AwsNodeName, map[string]string{
+						"WARM_ENI_TARGET":         "2",
+						"ENABLE_SUBNET_DISCOVERY": "true",
+					})
+
+				By("Waiting for ENI allocation to take effect")
+				time.Sleep(60 * time.Second)
+			})
+
+			AfterEach(func() {
+				By("Restoring primary subnet tag to cni=1 before releasing ENIs")
+				_, err := f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{primarySubnetID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("1"),
+							},
+						},
+					)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to restore primary subnet tag: %v\n", err)
+				}
+
+				By("Restoring BeforeSuite secondary subnet tag to cni=1")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{secondarySubnetID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("1"),
+							},
+						},
+					)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to restore secondary subnet tag: %v\n", err)
+				}
+
+				By("Excluding test subnet with cni=0 so CNI stops using it")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{secondarySubnetWithOldTagID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("0"),
+							},
+						},
+					)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to exclude test subnet: %v\n", err)
+				}
+
+				// Force the CNI to reclaim the now-unused ENIs in the excluded test subnet.
+				// WARM_ENI_TARGET=0 alone does not: excluding the subnet (cni=0) drops its IPs
+				// from the warm pool, which shuts the ENI-reclaim path. Setting WARM_IP_TARGET
+				// keeps that path always evaluating extra ENIs for deletion.
+				By("Forcing ENI reclaim so the test subnet's ENIs are released")
+				k8sUtils.AddEnvVarToDaemonSetAndWaitTillUpdated(f, utils.AwsNodeName, utils.AwsNodeNamespace,
+					utils.AwsNodeName, map[string]string{"WARM_IP_TARGET": "2", "WARM_ENI_TARGET": "0"})
+
+				// Delete only once the ENIs are gone, retrying to avoid a DependencyViolation
+				// that would leak the subnet into later specs.
+				By("Deleting test subnet once its ENIs are released")
+				Eventually(func() error {
+					return f.CloudServices.EC2().DeleteSubnet(context.TODO(), secondarySubnetWithOldTagID)
+				}, 3*time.Minute, 20*time.Second).Should(Succeed(), "test subnet should delete once its ENIs are released")
+
+				// Restore WARM_IP_TARGET to its prior (unset) state so the next spec starts clean.
+				By("Restoring WARM_IP_TARGET to its prior unset value")
+				k8sUtils.RemoveVarFromDaemonSetAndWaitTillUpdated(f, utils.AwsNodeName, utils.AwsNodeNamespace,
+					utils.AwsNodeName, map[string]struct{}{"WARM_IP_TARGET": {}})
+			})
+
+			It("should include subnet with cni=1 even if old cluster tag is present (old prefix is ignored)", func() {
+				By("Checking if any ENI was created in the old-tag subnet")
+				instance, err := f.CloudServices.EC2().DescribeInstance(context.TODO(), *primaryInstance.InstanceId)
+				Expect(err).ToNot(HaveOccurred())
+
+				enisInOldTagSubnet := 0
+				for _, eni := range instance.NetworkInterfaces {
+					if eni.SubnetId != nil && *eni.SubnetId == secondarySubnetWithOldTagID {
+						enisInOldTagSubnet++
+						GinkgoWriter.Printf("  Found ENI %s in old-tag subnet\n", *eni.NetworkInterfaceId)
+					}
+				}
+
+				GinkgoWriter.Printf("Found %d of %d ENIs in subnet %s (old-prefix cluster tag)\n",
+					enisInOldTagSubnet, len(instance.NetworkInterfaces), secondarySubnetWithOldTagID)
+
+				Expect(enisInOldTagSubnet).To(BeNumerically(">", 0),
+					"Subnet with cni=1 and old-style cluster tag should be discoverable (old prefix is invisible to new logic) — expected ENI creation in this subnet")
+			})
+		})
+
+		Context("when secondary subnet has cni=1 with different new cluster tag", func() {
+			var secondarySubnetWithDifferentClusterID string
+
+			BeforeEach(func() {
+				By("Creating secondary subnet for different cluster")
+				subnetOutput, err := f.CloudServices.EC2().
+					CreateSubnet(context.TODO(), "100.64.67.0/24", f.Options.AWSVPCID, *primaryInstance.Placement.AvailabilityZone)
+				Expect(err).ToNot(HaveOccurred())
+
+				secondarySubnetWithDifferentClusterID = *subnetOutput.Subnet.SubnetId
+
+				By("Tagging with cni=1 and new-style cluster tag for different cluster")
+				_, err = f.CloudServices.EC2().
+					CreateTags(
+						context.TODO(),
+						[]string{secondarySubnetWithDifferentClusterID},
+						[]ec2types.Tag{
+							{
+								Key:   aws.String("kubernetes.io/role/cni"),
+								Value: aws.String("1"),
+							},
+							{
+								Key:   aws.String("cni.networking.k8s.aws/cluster/other-cluster"),
+								Value: aws.String("shared"),
+							},
+						},
+					)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Restarting aws-node pods to apply subnet discovery")
+				restartAwsNodePods()
+
+				By("Waiting for configuration to take effect")
+				time.Sleep(30 * time.Second)
+			})
+
+			AfterEach(func() {
+				By("Deleting secondary subnet")
+				err := f.CloudServices.EC2().DeleteSubnet(context.TODO(), secondarySubnetWithDifferentClusterID)
+				if err != nil {
+					GinkgoWriter.Printf("Warning: Failed to delete subnet %s: %v\n", secondarySubnetWithDifferentClusterID, err)
+				}
+			})
+
+			It("should exclude subnet with cni=1 if cluster tag belongs to different cluster", func() {
+				By("Creating deployment that requires secondary ENIs")
+				container := manifest.NewNetCatAlpineContainer(f.Options.TestImageRegistry).
+					Command([]string{"sleep"}).
+					Args([]string{"3600"}).
+					Build()
+
+				deploymentBuilder := manifest.NewBusyBoxDeploymentBuilder(f.Options.TestImageRegistry).
+					Container(container).
+					Replicas(computeReplicasForBothSubnets(string(primaryInstance.InstanceType))). // Overflow onto a secondary ENI so cluster-isolation (different-cluster subnet skipped) is actually exercised
+					PodLabel(secondaryExclusionPodLabelKey, "different-cluster-isolation").
+					NodeName(*primaryInstance.PrivateDnsName).
+					Build()
+
+				var err error
+				deployment, err := f.K8sResourceManagers.DeploymentManager().
+					CreateAndWaitTillDeploymentIsReady(deploymentBuilder, utils.DefaultDeploymentReadyTimeout)
+				Expect(err).ToNot(HaveOccurred())
+
+				defer func() {
+					By("Cleaning up deployment")
+					err := f.K8sResourceManagers.DeploymentManager().DeleteAndWaitTillDeploymentIsDeleted(deployment)
+					Expect(err).ToNot(HaveOccurred())
+					time.Sleep(60 * time.Second)
+				}()
+
+				subnetCIDR := getSubnetCIDR(secondarySubnetWithDifferentClusterID)
+
+				By("Verifying pods avoid the subnet tagged for different cluster")
+				pods, err := f.K8sResourceManagers.PodManager().GetPodsWithLabelSelector(secondaryExclusionPodLabelKey, "different-cluster-isolation")
+				Expect(err).ToNot(HaveOccurred())
+
+				podsInDifferentClusterSubnet := 0
+				for _, pod := range pods.Items {
+					if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+						podIP := net.ParseIP(pod.Status.PodIP)
+						if subnetCIDR.Contains(podIP) {
+							podsInDifferentClusterSubnet++
+							GinkgoWriter.Printf("WARNING: Pod %s found in different-cluster subnet %s\n", pod.Name, pod.Status.PodIP)
+						}
+					}
+				}
+
+				Expect(podsInDifferentClusterSubnet).To(Equal(0),
+					"Subnet with cni=1 but belonging to different cluster should be excluded (cluster isolation)")
 			})
 		})
 	})
@@ -270,7 +625,7 @@ func validateSecondaryENIExclusionInDatastore() {
 			By(fmt.Sprintf("Checking secondary ENI exclusion in aws-node pod %s", pod.Name))
 
 			// Execute introspection command in the aws-node container
-			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecWithContainer(
+			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecInContainer(
 				pod.Namespace,
 				pod.Name,
 				"aws-node", // Specify the aws-node container
@@ -369,7 +724,7 @@ func validateExcludedSecondaryENIDeletable() {
 			By(fmt.Sprintf("Checking secondary ENI deletability in aws-node pod %s", pod.Name))
 
 			// Execute introspection command to check ENI status in the aws-node container
-			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecWithContainer(
+			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecInContainer(
 				pod.Namespace,
 				pod.Name,
 				"aws-node", // Specify the aws-node container
@@ -399,7 +754,7 @@ func validatePrefixCleanupOnExcludedSecondaryENI() {
 			By(fmt.Sprintf("Checking prefix cleanup on secondary ENIs in pod %s", pod.Name))
 
 			// Execute ENI introspection to check prefix allocation in the aws-node container
-			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecWithContainer(
+			stdout, stderr, err := f.K8sResourceManagers.PodManager().PodExecInContainer(
 				pod.Namespace,
 				pod.Name,
 				"aws-node", // Specify the aws-node container
