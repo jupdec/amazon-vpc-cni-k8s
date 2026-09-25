@@ -45,6 +45,14 @@ const (
 	//to move to stable state before error'ing out.
 	v6DADTimeout                = 10 * time.Second
 	MAX_MAC_GENERATION_ATTEMPTS = 10
+
+	// maxVlanID is the largest valid 802.1Q VLAN id. Branch ENI VLAN ids arrive
+	// via vpc.amazonaws.com/pod-eni annotation
+	maxVlanID = 4094
+
+	// vlanRouteTableOffset is added to a branch ENI VLAN id to derive the policy
+	// route table used for that pod's traffic.
+	vlanRouteTableOffset = 100
 )
 
 type VirtualInterfaceMetadata struct {
@@ -123,21 +131,38 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		},
 		PeerName:         createVethContext.hostVethName,
 		PeerHardwareAddr: createVethContext.hostMACAddr,
+		// Create the host end directly in the host namespace so it is
+		// registered exactly once. Creating both ends here and moving one out
+		// serializes concurrent pod creation on the kernel's rcu_barrier in
+		// __dev_change_net_namespace.
+		PeerNamespace: netlink.NsFd(int(hostNS.Fd())),
 	}
 
 	if err := createVethContext.netLink.LinkAdd(veth); err != nil {
 		return err
 	}
 
-	hostVeth, err := createVethContext.netLink.LinkByName(createVethContext.hostVethName)
-	if err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.hostVethName)
-	}
-
-	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
-	// veth won't get a link local address unless it's set to UP state.
-	if err = createVethContext.netLink.LinkSetUp(hostVeth); err != nil {
-		return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.hostVethName)
+	hostHardwareAddr := createVethContext.hostMACAddr
+	// The container end only has carrier when both veth ends are up, and the
+	// IPv6 DAD wait below needs carrier. Bring the host end up now; net.FlagUp
+	// at create time is not reliably applied on all platforms. The IPv6
+	// sysctls must be applied before the link comes up: the host end must
+	// never be up while still accepting router advertisements from the pod
+	// side.
+	if err := hostNS.Do(func(ns.NetNS) error {
+		hv, err := createVethContext.netLink.LinkByName(createVethContext.hostVethName)
+		if err != nil {
+			return errors.Wrapf(err, "setup NS network: failed to find host link %q", createVethContext.hostVethName)
+		}
+		if err := setHostVethV6Sysctls(createVethContext.procSys, createVethContext.hostVethName, createVethContext.log); err != nil {
+			return err
+		}
+		if err := createVethContext.netLink.LinkSetUp(hv); err != nil {
+			return errors.Wrapf(err, "setup NS network: failed to set host link %q up", createVethContext.hostVethName)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	contVeth, err := createVethContext.netLink.LinkByName(createVethContext.contVethName)
@@ -244,7 +269,7 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		LinkIndex:    contVeth.Attrs().Index,
 		State:        netlink.NUD_PERMANENT,
 		IP:           gwNet.IP,
-		HardwareAddr: hostVeth.Attrs().HardwareAddr,
+		HardwareAddr: hostHardwareAddr,
 	}
 
 	if err = createVethContext.netLink.NeighAdd(neigh); err != nil {
@@ -257,11 +282,6 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		}
 	}
 
-	// Now that the everything has been successfully set up in the container, move the "host" end of the
-	// veth into the host namespace.
-	if err = createVethContext.netLink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
-		return errors.Wrap(err, "setup NS network: failed to move veth to host netns")
-	}
 	return nil
 }
 
@@ -312,6 +332,19 @@ func (n *linuxNetwork) TeardownPodNetwork(vethMetadata []VirtualInterfaceMetadat
 	return nil
 }
 
+// vlanIDToRouteTable validates a branch ENI VLAN id and returns the policy
+// route table it maps to (vlanID + vlanRouteTableOffset).
+func vlanIDToRouteTable(vlanID int) (int, error) {
+	if vlanID < 1 || vlanID > maxVlanID {
+		return 0, errors.Errorf("invalid vlanID %d", vlanID)
+	}
+	rtTable := vlanID + vlanRouteTableOffset
+	if rtTable >= unix.RT_TABLE_DEFAULT && rtTable <= unix.RT_TABLE_LOCAL {
+		return 0, errors.Errorf("vlanID %d maps to reserved table %d", vlanID, rtTable)
+	}
+	return rtTable, nil
+}
+
 // SetupBranchENIPodNetwork sets up the network ns for pods requesting its own security group
 // we expect v4Addr and v6Addr to have correct IPAddress Family.
 func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMetadata, netnsPath string,
@@ -319,6 +352,11 @@ func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMet
 
 	log.Debugf("SetupBranchENIPodNetwork: hostVethName=%s, contVethName=%s, netnsPath=%s, ipAddr=%v, vlanID=%d, eniMAC=%s, subnetGW=%s, parentIfIndex=%d, mtu=%d, podSGEnforcingMode=%v",
 		vethMetadata.HostVethName, vethMetadata.ContainerVethName, netnsPath, vethMetadata.IPAddress, vlanID, eniMAC, subnetGW, parentIfIndex, mtu, podSGEnforcingMode)
+
+	rtTable, err := vlanIDToRouteTable(vlanID)
+	if err != nil {
+		return errors.Wrap(err, "SetupBranchENIPodNetwork")
+	}
 
 	hostVeth, err := n.setupVeth(vethMetadata.HostVethName, vethMetadata.ContainerVethName, netnsPath, vethMetadata.IPAddress, mtu, log, 0)
 	if err != nil {
@@ -342,7 +380,6 @@ func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMet
 		return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to delete hostVeth rule for %s", vethMetadata.HostVethName)
 	}
 
-	rtTable := vlanID + 100
 	vlanLink, err := n.setupVlan(vlanID, eniMAC, subnetGW, parentIfIndex, rtTable, log)
 	if err != nil {
 		return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to setup vlan")
@@ -365,6 +402,13 @@ func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMet
 func (n *linuxNetwork) TeardownBranchENIPodNetwork(vethMetadata VirtualInterfaceMetadata, vlanID int, _ sgpp.EnforcingMode, log logger.Logger) error {
 	log.Debugf("TeardownBranchENIPodNetwork: containerAddr=%s, vlanID=%d", vethMetadata.IPAddress.String(), vlanID)
 
+	// Validate the VLAN id -> route table mapping before issuing any deletes.
+	rtTable, err := vlanIDToRouteTable(vlanID)
+	if err != nil {
+		log.Errorf("TeardownBranchENIPodNetwork: skipping teardown, %v", err)
+		return nil
+	}
+
 	if err := n.teardownVlan(vlanID, log); err != nil {
 		return errors.Wrapf(err, "TeardownBranchENIPodNetwork: failed to teardown vlan")
 	}
@@ -374,7 +418,6 @@ func (n *linuxNetwork) TeardownBranchENIPodNetwork(vethMetadata VirtualInterface
 		ipFamily = unix.AF_INET6
 	}
 	// to handle the migration between different enforcingMode, we try to clean up rules under both mode since the pod might be setup with a different mode.
-	rtTable := vlanID + 100
 	if err := n.teardownIIFBasedContainerRouteRules(rtTable, ipFamily, log); err != nil {
 		return errors.Wrapf(err, "TeardownBranchENIPodNetwork: unable to teardown IIF based container routes and rules")
 	}
@@ -386,6 +429,32 @@ func (n *linuxNetwork) TeardownBranchENIPodNetwork(vethMetadata VirtualInterface
 }
 
 // setupVeth sets up veth for the pod.
+// setHostVethV6Sysctls hardens the host-side veth for IPv6: accept_ra=0,
+// accept_redirects=1, forwarding=0. Must be applied before the link is
+// brought up so the host end never accepts router advertisements from the
+// pod side.
+func setHostVethV6Sysctls(procSys procsyswrapper.ProcSys, hostVethName string, log logger.Logger) error {
+	if err := procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", hostVethName), "0"); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Wrapf(err, "failed to disable IPv6 router advertisements")
+		}
+		log.Debugf("Ignoring '%v' writing to accept_ra: Assuming kernel lacks IPv6 support", err)
+	}
+	if err := procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/accept_redirects", hostVethName), "1"); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Wrapf(err, "failed to disable IPv6 ICMP redirects")
+		}
+		log.Debugf("Ignoring '%v' writing to accept_redirects: Assuming kernel lacks IPv6 support", err)
+	}
+	if err := procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/forwarding", hostVethName), "0"); err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Wrapf(err, "failed to disable IPv6 forwarding")
+		}
+		log.Debugf("Ignoring '%v' writing to forwarding: Assuming kernel lacks IPv6 support", err)
+	}
+	return nil
+}
+
 func (n *linuxNetwork) setupVeth(hostVethName string, contVethName string, netnsPath string, ipAddr *net.IPNet, mtu int, log logger.Logger, index int) (netlink.Link, error) {
 	// Clean up if hostVeth exists.
 	if oldHostVeth, err := n.netLink.LinkByName(hostVethName); err == nil {
@@ -407,39 +476,12 @@ func (n *linuxNetwork) setupVeth(hostVethName string, contVethName string, netns
 		return nil, errors.Wrap(err, "failed to setup veth network")
 	}
 
+	// The host end was created directly in the host namespace by run(); its
+	// IPv6 sysctls and bring-up were applied there (via hostNS.Do) before the
+	// link came up.
 	hostVeth, err := n.netLink.LinkByName(hostVethName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to find hostVeth %s", hostVethName)
-	}
-
-	// For IPv6, host veth sysctls must be set to:
-	// 1. accept_ra=0
-	// 2. accept_redirects=1
-	// 3. forwarding=0
-	if err := n.procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", hostVethName), "0"); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, errors.Wrapf(err, "failed to disable IPv6 router advertisements")
-		}
-		log.Debugf("Ignoring '%v' writing to accept_ra: Assuming kernel lacks IPv6 support", err)
-	}
-	if err := n.procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/accept_redirects", hostVethName), "1"); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, errors.Wrapf(err, "failed to disable IPv6 ICMP redirects")
-		}
-		log.Debugf("Ignoring '%v' writing to accept_redirects: Assuming kernel lacks IPv6 support", err)
-	}
-	if err := n.procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/forwarding", hostVethName), "0"); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, errors.Wrapf(err, "failed to disable IPv6 forwarding")
-		}
-		log.Debugf("Ignoring '%v' writing to forwarding: Assuming kernel lacks IPv6 support", err)
-	}
-	log.Debugf("Successfully set IPv6 sysctls on hostVeth %s", hostVethName)
-
-	// Explicitly set the veth to UP state, because netlink doesn't always do that on all the platforms with net.FlagUp.
-	// veth won't get a link local address unless it's set to UP state.
-	if err = n.netLink.LinkSetUp(hostVeth); err != nil {
-		return nil, errors.Wrapf(err, "failed to setup hostVeth %s", hostVethName)
 	}
 	return hostVeth, nil
 }

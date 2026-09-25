@@ -30,6 +30,7 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/sagemaker"
 	"github.com/golang/mock/gomock"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -37,6 +38,7 @@ import (
 
 	mock_ec2wrapper "github.com/aws/amazon-vpc-cni-k8s/pkg/ec2wrapper/mocks"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
+	mock_sagemakerwrapper "github.com/aws/amazon-vpc-cni-k8s/pkg/sagemakerwrapper/mocks"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/eventrecorder"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/logger"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/vpc"
@@ -236,6 +238,24 @@ func TestInitWithEC2metadata(t *testing.T) {
 		assert.Equal(t, cache.primaryENImac, primaryMAC)
 		assert.Equal(t, cache.primaryENI, primaryeniID)
 		assert.Equal(t, cache.vpcID, vpcID)
+	}
+}
+
+func TestInitWithEC2metadataIPv6(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+	mockMetadata := testMetadata(map[string]interface{}{
+		"ipv6": eni1v6IP,
+	})
+
+	cache := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, ec2SVC: mockEC2, v6Enabled: true}
+	err := cache.initWithEC2Metadata(ctx)
+	if assert.NoError(t, err) {
+		assert.Equal(t, eni1v6IP, cache.localIPv6.String())
+		assert.Equal(t, eni1v6IP, cache.GetLocalIPv6().String())
 	}
 }
 
@@ -587,6 +607,103 @@ func TestAllocENI(t *testing.T) {
 		imds:               TypedIMDS{mockMetadata},
 		instanceType:       "c5n.18xlarge",
 		useSubnetDiscovery: true,
+	}
+
+	_, err := cache.AllocENI(context.Background(), nil, "", 5, 0)
+	assert.NoError(t, err)
+}
+
+func TestParseHyperPodProviderID(t *testing.T) {
+	cases := []struct {
+		name        string
+		providerID  string
+		wantCluster string
+		wantOK      bool
+	}{
+		{
+			name:        "hyperpod node",
+			providerID:  "aws:///us-east-1a/sagemaker/cluster/hyperpod-abc123def456-i-0123456789abcdef0",
+			wantCluster: "abc123def456",
+			wantOK:      true,
+		},
+		{
+			name:       "normal eks node",
+			providerID: "aws:///us-east-1a/i-0123456789abcdef0",
+			wantOK:     false,
+		},
+		{
+			name:       "empty",
+			providerID: "",
+			wantOK:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster, ok := parseHyperPodProviderID(tc.providerID)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.wantCluster, cluster)
+		})
+	}
+}
+
+// TestInitHyperPodFromProviderID asserts detection is deterministic from the providerID and does not depend on STS.
+func TestInitHyperPodFromProviderID(t *testing.T) {
+	// Non-HyperPod providerID returns before any STS call and leaves isHyperPod false (EC2 attach path).
+	t.Run("non-hyperpod node leaves EC2 attach path", func(t *testing.T) {
+		cache := &EC2InstanceMetadataCache{region: "us-east-1"}
+		err := cache.InitHyperPodFromProviderID(context.Background(), "aws:///us-east-1a/i-0123456789abcdef0")
+		assert.NoError(t, err)
+		assert.False(t, cache.sagemakerMeta.isHyperPod)
+		assert.Empty(t, cache.sagemakerMeta.hyperPodClusterID)
+		assert.Empty(t, cache.sagemakerMeta.hyperPodClusterName)
+	})
+}
+
+// TestAllocENIHyperPod verifies that on a HyperPod node the ENI is still created
+// via ec2:CreateNetworkInterface (customer account), but the attach is delegated to
+// sagemaker:AttachClusterNodeNetworkInterface instead of ec2:AttachNetworkInterface.
+// AttachNetworkInterface / DescribeInstances must NOT be called on this path.
+func TestAllocENIHyperPod(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+	mockSM := mock_sagemakerwrapper.NewMockSageMaker(ctrl)
+
+	mockMetadata := testMetadata(nil)
+
+	ipAddressCount := int32(100)
+	subnetResult := &ec2.DescribeSubnetsOutput{
+		Subnets: []ec2types.Subnet{{
+			AvailableIpAddressCount: &ipAddressCount,
+			SubnetId:                aws.String(subnetID),
+			Tags: []ec2types.Tag{
+				{Key: aws.String("kubernetes.io/role/cni"), Value: aws.String("1")},
+			},
+		}},
+	}
+	mockEC2.EXPECT().DescribeSubnets(gomock.Any(), gomock.Any(), gomock.Any()).Return(subnetResult, nil)
+
+	cureniID := eniID
+	eni := ec2.CreateNetworkInterfaceOutput{NetworkInterface: &ec2types.NetworkInterface{NetworkInterfaceId: &cureniID}}
+	mockEC2.EXPECT().CreateNetworkInterface(gomock.Any(), gomock.Any(), gomock.Any()).Return(&eni, nil)
+
+	// The attach goes through SageMaker, not EC2. Not setting AttachNetworkInterface /
+	// DescribeInstances expectations asserts they are not invoked on this path.
+	attachmentID := "eni-attach-hyperpod"
+	smOut := &sagemaker.AttachClusterNodeNetworkInterfaceOutput{AttachmentId: &attachmentID}
+	mockSM.EXPECT().AttachClusterNodeNetworkInterface(gomock.Any(), gomock.Any()).Return(smOut, nil)
+	mockEC2.EXPECT().ModifyNetworkInterfaceAttribute(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+
+	cache := &EC2InstanceMetadataCache{
+		ec2SVC:             mockEC2,
+		imds:               TypedIMDS{mockMetadata},
+		instanceType:       "c5n.18xlarge",
+		useSubnetDiscovery: true,
+		instanceID:         "i-1234567890",
+		sagemakerMeta: sagemakerMetadata{
+			isHyperPod:          true,
+			hyperPodClusterName: "arn:aws:sagemaker:us-west-2:123456789012:cluster/cluster1",
+			sagemakerSVC:        mockSM,
+		},
 	}
 
 	_, err := cache.AllocENI(context.Background(), nil, "", 5, 0)
@@ -3815,4 +3932,79 @@ func TestDescribeAllENIsNoConnectionTracking(t *testing.T) {
 	_, err := cache.DescribeAllENIs(context.Background())
 	assert.NoError(t, err)
 	assert.Nil(t, cache.connectionTrackingSpec)
+}
+
+// TestGetAttachedENIsIPv6OnlyENIInIPv4Cluster tests that an unmanaged-ENI with only IPv6
+// addresses does not cause a crash when the cluster is running in IPv4 mode
+func TestGetAttachedENIsIPv6OnlyENIInIPv4Cluster(t *testing.T) {
+	mockMetadata := testMetadata(map[string]interface{}{
+		metadataMACPath:                                  primaryMAC + " " + eni2MAC,
+		metadataMACPath + eni2MAC:                        imdsMACFieldsV6Only,
+		metadataMACPath + eni2MAC + metadataDeviceNum:    eni2Device,
+		metadataMACPath + eni2MAC + metadataInterface:    eni2ID,
+		metadataMACPath + eni2MAC + metadataSubnetID:     subnetID,
+		metadataMACPath + eni2MAC + metadataIPv6s:        eni2v6IP,
+		metadataMACPath + eni2MAC + metadataSubnetV6CIDR: subnetv6CIDR,
+	})
+
+	// IPv4 mode cluster: v4Enabled=true, v6Enabled=false
+	cache := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, v4Enabled: true, v6Enabled: false}
+	ens, err := cache.GetAttachedENIs()
+	if assert.NoError(t, err) {
+		assert.Equal(t, 2, len(ens))
+		// The IPv6-only ENI should have its IPv6 addresses populated
+		assert.Len(t, ens[1].IPv6Addresses, 1)
+		assert.Equal(t, eni2v6IP, aws.ToString(ens[1].IPv6Addresses[0].Ipv6Address))
+		// No IPv4 addresses on this ENI
+		assert.Empty(t, ens[1].IPv4Addresses)
+	}
+}
+
+func TestAllocIPv6PrefixesRetryOnThrottle(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+
+	throttleErr := &smithy.GenericAPIError{Code: "Throttling", Message: "Rate exceeded"}
+	successOut := &ec2.AssignIpv6AddressesOutput{AssignedIpv6Prefixes: []string{"2001:db8::/80"}}
+
+	gomock.InOrder(
+		mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, throttleErr),
+		mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, throttleErr),
+		mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, throttleErr),
+		mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(successOut, nil),
+	)
+
+	cache := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	prefixes, err := cache.allocIPv6Prefixes(context.Background(), eniID, time.Millisecond)
+	assert.NoError(t, err)
+	if assert.Len(t, prefixes, 1) {
+		assert.Equal(t, "2001:db8::/80", aws.ToString(prefixes[0]))
+	}
+}
+
+func TestAllocIPv6PrefixesRetryExhausted(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+
+	throttleErr := &smithy.GenericAPIError{Code: "Throttling", Message: "Rate exceeded"}
+	for i := 0; i < maxENIEC2APIRetries; i++ {
+		mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, throttleErr)
+	}
+
+	cache := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	_, err := cache.allocIPv6Prefixes(context.Background(), eniID, time.Millisecond)
+	assert.Error(t, err)
+}
+
+func TestAllocIPv6PrefixesNonRetryable(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+
+	authErr := &smithy.GenericAPIError{Code: "UnauthorizedOperation", Message: "not authorized"}
+	// Exactly one call expected — non-retryable errors must short-circuit.
+	mockEC2.EXPECT().AssignIpv6Addresses(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, authErr).Times(1)
+
+	cache := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	_, err := cache.allocIPv6Prefixes(context.Background(), eniID, time.Millisecond)
+	assert.Error(t, err)
 }

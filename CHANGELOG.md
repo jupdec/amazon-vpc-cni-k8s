@@ -1,5 +1,94 @@
 # Changelog
 
+## v1.23.2
+
+* Self-heal the IPv6 datastore and harden EC2 client retry behavior ([#3873](https://github.com/aws/amazon-vpc-cni-k8s/pull/3873), @emilyhuaa)
+* Reject invalid VLAN IDs in routed-eni, validating before veth creation ([#3854](https://github.com/aws/amazon-vpc-cni-k8s/pull/3854), @zac-nixon)
+* Fail open when the `DescribeSubnets` call for ENI subnet discovery fails ([#3843](https://github.com/aws/amazon-vpc-cni-k8s/pull/3843), @cdirubbio)
+* Use the `sagemaker:AttachClusterNodeNetworkInterface` API for HyperPod nodes ([#3874](https://github.com/aws/amazon-vpc-cni-k8s/pull/3874), @AshwinS27)
+* Bump to Go 1.26.6 ([#3865](https://github.com/aws/amazon-vpc-cni-k8s/pull/3865), @zac-nixon)
+* Fix flaky SNAT test ([#3869](https://github.com/aws/amazon-vpc-cni-k8s/pull/3869), @zac-nixon)
+* Bump the curl image version used in tests ([#3881](https://github.com/aws/amazon-vpc-cni-k8s/pull/3881), @cdirubbio)
+* Update the Nginx test image to 1.31.5-alpine-slim ([#3883](https://github.com/aws/amazon-vpc-cni-k8s/pull/3883), @cdirubbio)
+* Update perf-cluster AMI family to AmazonLinux2023 ([#3884](https://github.com/aws/amazon-vpc-cni-k8s/pull/3884), @cdirubbio)
+* Bump the `aws-dependencies` group with 11 updates (aws-sdk-go-v2 services, smithy-go) ([#3850](https://github.com/aws/amazon-vpc-cni-k8s/pull/3850))
+* Bump the `k8s-dependencies` group with 4 updates ([#3866](https://github.com/aws/amazon-vpc-cni-k8s/pull/3866))
+* Bump the `other-deps` group with 2 updates (`docker/setup-qemu-action`, `docker/setup-buildx-action`) ([#3870](https://github.com/aws/amazon-vpc-cni-k8s/pull/3870))
+* Bump `google.golang.org/grpc` from 1.83.1 to 1.83.2 ([#3867](https://github.com/aws/amazon-vpc-cni-k8s/pull/3867))
+* Bump `github.com/containernetworking/plugins` from 1.9.0 to 1.9.1 ([#3851](https://github.com/aws/amazon-vpc-cni-k8s/pull/3851))
+* Bump `google.golang.org/protobuf` to 1.36.12 ([#3853](https://github.com/aws/amazon-vpc-cni-k8s/pull/3853))
+* Bump `helm.sh/helm/v4` from 4.2.2 to 4.3.0 ([#3852](https://github.com/aws/amazon-vpc-cni-k8s/pull/3852))
+* Bump `aws-actions/configure-aws-credentials` from 6.2.3 to 6.2.4 ([#3860](https://github.com/aws/amazon-vpc-cni-k8s/pull/3860))
+
+## v1.23.1
+
+* Serve node IP and instance ID to the Network Policy Agent via gRPC — the agent now sources `NodeIPv4`, `NodeIPv6`, and `InstanceID` from ipamd instead of querying IMDS ([#3827](https://github.com/aws/amazon-vpc-cni-k8s/pull/3827), @viveksb007)
+* Add `Region` to `NetworkPolicyAgentConfigReply` so the agent can resolve its region without calling IMDS ([#3829](https://github.com/aws/amazon-vpc-cni-k8s/pull/3829), @viveksb007)
+* Update VPC IP resource limits ([#3801](https://github.com/aws/amazon-vpc-cni-k8s/pull/3801))
+* Don't fail on IPv6-only unmanaged ENIs in an IPv4 cluster (handled via `getENIMetadata`) ([#3681](https://github.com/aws/amazon-vpc-cni-k8s/pull/3681), @cdirubbio)
+* Clean up the `primaryIP` map entry when an ENI is freed in `tryFreeENI` ([#3727](https://github.com/aws/amazon-vpc-cni-k8s/pull/3727))
+* Helm: render `podMonitor.scrapeTimeout` in the PodMonitor template ([#3804](https://github.com/aws/amazon-vpc-cni-k8s/pull/3804), @OdaloV)
+* Pin busybox and curl images used in tests ([#3820](https://github.com/aws/amazon-vpc-cni-k8s/pull/3820))
+* Bump `github.com/go-logr/logr` from 1.4.3 to 1.4.4 ([#3817](https://github.com/aws/amazon-vpc-cni-k8s/pull/3817))
+* Bump the `aws-dependencies` group with 11 updates (aws-sdk-go-v2 services, vpc-resource-controller, smithy-go) ([#3815](https://github.com/aws/amazon-vpc-cni-k8s/pull/3815))
+* Bump `github.com/apparentlymart/go-cidr` from 1.1.0 to 1.1.1 ([#3816](https://github.com/aws/amazon-vpc-cni-k8s/pull/3816))
+* Bump `oras.land/oras-go/v2` from 2.6.1 to 2.6.2 ([#3828](https://github.com/aws/amazon-vpc-cni-k8s/pull/3828))
+* Bump `github.com/aws/amazon-vpc-cni-k8s` (test/agent) from 1.22.3 to 1.22.4 ([#3814](https://github.com/aws/amazon-vpc-cni-k8s/pull/3814))
+* Bump `actions/stale` from 10.4.0 to 11.0.0 ([#3812](https://github.com/aws/amazon-vpc-cni-k8s/pull/3812))
+* Bump `aws-actions/configure-aws-credentials` from 6.2.2 to 6.2.3 ([#3794](https://github.com/aws/amazon-vpc-cni-k8s/pull/3794))
+
+## v1.23.0
+
+> [!WARNING]
+> This release must be run with Network Policy Agent `v1.4.1`. #3739 moves the IPAMD gRPC server from a TCP port to a Unix domain socket, so the Network Policy Agent must be on `v1.4.1` to connect over the socket.
+
+* chore: deps bump for CVE fix by @viveksb007 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3689
+* chore: bump containernetworking/plugins FETCH_VERSION to v1.9.0 by @nakshah87 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3687
+* Adding CNI v1.21.2 release by @haouc in https://github.com/aws/amazon-vpc-cni-k8s/pull/3690
+* Add ec2:DescribeSecurityGroups to IAM policy by @johanneswuerbach in https://github.com/aws/amazon-vpc-cni-k8s/pull/3709
+* Add prerouting connmark rules through nftable instead of iptables. by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3588
+* Mixed os snat weekly cron by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3707
+* pkg/ipamd: fix dropped test error by @alrs in https://github.com/aws/amazon-vpc-cni-k8s/pull/3622
+* Fix unmanaged eni by @jaydeokar in https://github.com/aws/amazon-vpc-cni-k8s/pull/3660
+* Latest nginx by @Issacwww in https://github.com/aws/amazon-vpc-cni-k8s/pull/3733
+* chore: update VPC IP resource limits by @github-actions[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3673
+* build(deps): bump actions/checkout from 6.0.2 to 6.0.3 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3718
+* build(deps): bump docker/setup-qemu-action from 3.6.0 to 4.1.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3715
+* build(deps): bump golang.org/x/sys from 0.41.0 to 0.45.0 in /test/agent by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3714
+* build(deps): bump actions/dependency-review-action from 4.9.0 to 5.0.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3679
+* build(deps): bump actions/stale from 10.2.0 to 10.3.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3701
+* build(deps): bump docker/setup-buildx-action from 4.0.0 to 4.1.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3700
+* build(deps): bump github.com/onsi/ginkgo/v2 from 2.25.1 to 2.32.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3641
+* chore: cleanup dead code from esgd revert by @cdirubbio in https://github.com/aws/amazon-vpc-cni-k8s/pull/3728
+* test/eni-subnet-discovery: size replicas by instance ENI capacity and harden cleanup by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3742
+* build(deps): bump github.com/samber/lo from 1.51.0 to 1.53.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3750
+* build(deps): bump go.uber.org/zap from 1.27.1 to 1.28.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3751
+* build(deps): bump golang.org/x/sys from 0.45.0 to 0.46.0 in /test/agent by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3749
+* fix: resolve ci account vpc leaking during ITs by @cdirubbio in https://github.com/aws/amazon-vpc-cni-k8s/pull/3755
+* tests: update eksctl for CI to not use default addon PDBs by @cdirubbio in https://github.com/aws/amazon-vpc-cni-k8s/pull/3757
+* Move gRPC server to Unix socket and scrub introspection data by @oliviassss in https://github.com/aws/amazon-vpc-cni-k8s/pull/3739
+* build(deps): bump docker/setup-buildx-action from 4.1.0 to 4.2.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3760
+* build(deps): bump docker/setup-qemu-action from 4.1.0 to 4.2.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3761
+* build(deps): bump actions/checkout from 6.0.3 to 7.0.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3745
+* Group github action dependency updates together by @jaydeokar in https://github.com/aws/amazon-vpc-cni-k8s/pull/3766
+* build(deps): bump golang.org/x/net from 0.55.0 to 0.57.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3771
+* test/eni-subnet-discovery: bound subnet teardown to 5m poll and fail loud on leak by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3773
+* test: fix custom-networking BeforeSuite ASG scale-to-0 wait by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3775
+* Fix misleading duration format in DAD-wait timeout error message by @viveksb007 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3776
+* build(deps): bump the other-deps group with 2 updates by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3772
+* build(deps): bump the aws-dependencies group across 1 directory with 11 updates by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3648
+* build(deps): bump golang.org/x/sys from 0.46.0 to 0.47.0 in /test/agent by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3767
+* build(deps): bump github.com/onsi/gomega from 1.40.0 to 1.42.1 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3769
+* build(deps): bump github.com/prometheus/common from 0.67.5 to 0.69.0 by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3770
+* chore: update VPC IP resource limits by @jaydeokar in https://github.com/aws/amazon-vpc-cni-k8s/pull/3778
+* build(deps): bump aws-actions/configure-aws-credentials from 5579c002bb4778aa43395ef1df492868a9a1c83f to e3dd6a429d7300a6a4c196c26e071d42e0343502 in the aws-deps group across 1 directory by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3768
+* build(deps): bump github.com/aws/amazon-vpc-cni-k8s from 1.20.4 to 1.22.3 in /test/agent in the aws-dependencies group across 1 directory by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3748
+* build(deps): bump aws-actions/configure-aws-credentials from 4.0.2 to 6.2.2 in the aws-deps group by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3783
+* build(deps): bump the other-deps group with 3 updates by @dependabot[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3784
+* test: pin nginx image to 1.31.2 (nginx:latest tag does not exist) by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3786
+* test: fix custom-networking/SGPP integration failures and teardown VPC leak by @yash97 in https://github.com/aws/amazon-vpc-cni-k8s/pull/3787
+* chore: update VPC IP resource limits by @github-actions[bot] in https://github.com/aws/amazon-vpc-cni-k8s/pull/3790
+
 ## v1.22.2
 
 * Reverting Security Group Discovery feature in https://github.com/aws/amazon-vpc-cni-k8s/pull/3720

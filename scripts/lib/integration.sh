@@ -37,11 +37,10 @@ function run_kops_conformance() {
   TEST_START=$SECONDS
   TEST_RESULT=success
 
-  /tmp/e2e.test --ginkgo.focus="Conformance" --ginkgo.timeout=120m --kubeconfig=$KUBECONFIG --ginkgo.v --ginkgo.trace --ginkgo.flake-attempts 8 \
-    --ginkgo.skip="(works for CRD with validation schema)|(ServiceAccountIssuerDiscovery should support OIDC discovery of service account issuer)|(should support remote command execution over websockets)|(should support retrieving logs from the container over websockets)|(Basic StatefulSet functionality [StatefulSetBasic])|\[Slow\]|\[Serial\]" || TEST_RESULT=fail
-
-  /tmp/e2e.test --ginkgo.focus="\[Serial\].*Conformance" --ginkgo.timeout=120m --kubeconfig=$KUBECONFIG --ginkgo.v --ginkgo.trace --ginkgo.flake-attempts 8 \
-    --ginkgo.skip="(ServiceAccountIssuerDiscovery should support OIDC discovery of service account issuer)|(should support remote command execution over websockets)|(should support retrieving logs from the container over websockets)|\[Slow\]" || TEST_RESULT=fail
+  # Scope to [sig-network] Conformance: the CNI's datapath (pod-to-pod, Services, DNS,
+  # Endpoints/EndpointSlices). These specs are all parallel-safe, so a single pass suffices.
+  /tmp/e2e.test --ginkgo.focus="\[sig-network\].*\[Conformance\]" --ginkgo.timeout=120m --kubeconfig=$KUBECONFIG --ginkgo.v --ginkgo.trace --ginkgo.flake-attempts 8 \
+    --ginkgo.skip="(should support remote command execution over websockets)|(should support retrieving logs from the container over websockets)|\[Slow\]|\[Serial\]" || TEST_RESULT=fail
 
   TEST_DURATION=$((SECONDS - TEST_START))
 
@@ -52,7 +51,7 @@ function run_kops_conformance() {
   # If any test failed, return failure
   if [[ "$TEST_RESULT" == "fail" ]]; then
     echo "One or more test suites failed!"
-    exit 1
+    return 1
   fi
 
   echo "All test suites passed successfully!"
@@ -69,11 +68,6 @@ function run_kops_conformance() {
   KOPS_TEST_DURATION=$((SECONDS - START))
   echo "=== Test Run Complete ==="
   echo "TIMELINE: KOPS tests took $KOPS_TEST_DURATION seconds"
-
-  # Workaround to avoid ENI leakage during cluster deletion
-  # See: https://github.com/aws/amazon-vpc-cni-k8s/issues/1223
-  echo "Waiting for 240 seconds to avoid ENI leakage..."
-  sleep 240
 
   # Exit with the test exit code
   return 0

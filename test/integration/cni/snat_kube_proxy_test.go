@@ -48,19 +48,8 @@ var _ = Describe("test SNAT with kube-proxy modes", func() {
 			Port(v1.ContainerPort{ContainerPort: 80, Protocol: "TCP"}).
 			Build()
 
-		deployment = manifest.NewDefaultDeploymentBuilder().
-			Name("snat-test-server").
-			Container(serverContainer).
-			Replicas(maxIPPerInterface*2).
-			NodeName(primaryNode.Name).
-			PodLabel("app", "snat-test").
-			Build()
-
-		deployment, err = f.K8sResourceManagers.DeploymentManager().
-			CreateAndWaitTillDeploymentIsReady(deployment, utils.DefaultDeploymentReadyTimeout)
-		Expect(err).ToNot(HaveOccurred())
-
-		interfaceToPodList = common.GetPodsOnPrimaryAndSecondaryInterface(primaryNode, "app", "snat-test", f)
+		interfaceToPodList, deployment = common.CreateDeploymentSpanningENIs(f, primaryNode,
+			"snat-test-server", "app", "snat-test", serverContainer)
 		Expect(len(interfaceToPodList.PodsOnPrimaryENI)).Should(BeNumerically(">=", 1))
 		Expect(len(interfaceToPodList.PodsOnSecondaryENI)).Should(BeNumerically(">=", 1))
 
@@ -102,6 +91,10 @@ var _ = Describe("test SNAT with kube-proxy modes", func() {
 			DeferCleanup(func() {
 				By(fmt.Sprintf("restoring kube-proxy mode to %s", originalMode))
 				Expect(setKubeProxyMode(originalMode)).To(Succeed())
+				if mode == "ipvs" && originalMode != "ipvs" {
+					By("cleaning up node state left behind by ipvs mode")
+					Expect(cleanupIPVSLeftovers()).To(Succeed())
+				}
 			})
 
 			By(fmt.Sprintf("switching kube-proxy to %s mode", mode))
@@ -248,6 +241,30 @@ func setKubeProxyMode(mode string) error {
 	return restartKubeProxyPods()
 }
 
+// cleanupIPVSLeftovers removes ipvs state that kube-proxy startup never
+// cleans when restoring an iptables-based mode (iptables and ipvs are one
+// family in platformCleanup). A leftover kube-ipvs0 keeps Service ClusterIPs
+// bound to the node and black-holes host-network pods started later.
+// Ref: https://github.com/kubernetes/kubeadm/issues/3133
+func cleanupIPVSLeftovers() error {
+	nodes, err := f.K8sResourceManagers.NodeManager().GetNodes(f.Options.NgNameLabelKey, f.Options.NgNameLabelVal)
+	if err != nil {
+		return err
+	}
+	cleanup := "ipvsadm --clear 2>/dev/null; ip link del kube-ipvs0 2>/dev/null; " +
+		"[ ! -e /sys/class/net/kube-ipvs0 ] && ! grep -qE \"^(TCP|UDP|SCTP)\" /proc/net/ip_vs 2>/dev/null"
+	// execNodeShellWithRetries retries any failure for ~5 minutes, which covers
+	// both node-shell scaffolding flakes and a kube-proxy pod that restarted
+	// with a stale (still ipvs) config recreating the interface and virtual
+	// services between cleanup and check: re-running the command re-cleans.
+	for _, node := range nodes.Items {
+		if out, err := execNodeShellWithRetries(node.Name, cleanup, 2*time.Minute); err != nil {
+			return fmt.Errorf("ipvs cleanup on node %s left interface or virtual services behind: %w (output: %s)", node.Name, err, out)
+		}
+	}
+	return nil
+}
+
 func restartKubeProxyPods() error {
 	pods, err := f.K8sResourceManagers.PodManager().GetPodsWithLabelSelector("k8s-app", "kube-proxy")
 	if err != nil {
@@ -293,21 +310,23 @@ func detectIptablesBackend(nodeName string) string {
 // verifyConnmarkRules checks that CNI connmark rules exist ONLY in the appropriate backend
 func verifyConnmarkRules(nodeName, backend string) {
 	if backend == "nftables" {
-		out, err := execNodeShell(nodeName, "nft list table ip aws-cni")
+		out, err := execNodeShellWithRetries(nodeName, "nft list table ip aws-cni", 2*time.Minute)
 		fmt.Fprintf(GinkgoWriter, "nftables rules:\n%s\n", string(out))
 		Expect(err).ToNot(HaveOccurred())
 		Expect(string(out)).To(ContainSubstring("chain nat-prerouting"))
 		Expect(string(out)).To(ContainSubstring("chain snat-mark"))
 
-		out, _ = execNodeShell(nodeName, "iptables-legacy -t nat -L PREROUTING -n")
+		out, _ = execNodeShellWithRetries(nodeName, "iptables-legacy -t nat -L PREROUTING -n", 2*time.Minute)
 		Expect(string(out)).ToNot(ContainSubstring("AWS-CONNMARK"))
 	} else {
-		out, err := execNodeShell(nodeName, "iptables-legacy -t nat -L PREROUTING -n")
+		out, err := execNodeShellWithRetries(nodeName, "iptables-legacy -t nat -L PREROUTING -n", 2*time.Minute)
 		fmt.Fprintf(GinkgoWriter, "iptables-legacy:\n%s\n", string(out))
 		Expect(err).ToNot(HaveOccurred())
 		Expect(string(out)).To(ContainSubstring("AWS-CONNMARK"))
 
-		_, err = execNodeShell(nodeName, "nft list table ip aws-cni")
-		Expect(err).To(HaveOccurred())
+		// Inverted so that success means the aws-cni nftables table is absent,
+		// keeping the retry-on-failure semantics of execNodeShellWithRetries.
+		out, err = execNodeShellWithRetries(nodeName, "! nft list table ip aws-cni", 2*time.Minute)
+		Expect(err).ToNot(HaveOccurred(), "aws-cni nftables table should not exist with %s backend (output: %s)", backend, out)
 	}
 }

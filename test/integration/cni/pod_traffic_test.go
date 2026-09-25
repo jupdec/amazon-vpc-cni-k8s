@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/amazon-vpc-cni-k8s/test/framework/utils"
 	"github.com/aws/amazon-vpc-cni-k8s/test/integration/common"
@@ -96,22 +97,9 @@ var _ = Describe("test pod networking", func() {
 			Build()
 
 		By("creating server deployment on the primary node")
-		primaryNodeDeployment = manifest.
-			NewDefaultDeploymentBuilder().
-			Container(serverContainer).
-			Replicas(maxIPPerInterface*2). // X2 so Pods are created on secondary ENI too
-			NodeName(primaryNode.Name).
-			PodLabel("node", "primary").
-			Name("primary-node-server").
-			Build()
-
-		primaryNodeDeployment, err = f.K8sResourceManagers.
-			DeploymentManager().
-			CreateAndWaitTillDeploymentIsReady(primaryNodeDeployment, utils.DefaultDeploymentReadyTimeout)
-		Expect(err).ToNot(HaveOccurred())
-
-		interfaceToPodListOnPrimaryNode =
-			common.GetPodsOnPrimaryAndSecondaryInterface(primaryNode, "node", "primary", f)
+		interfaceToPodListOnPrimaryNode, primaryNodeDeployment =
+			common.CreateDeploymentSpanningENIs(f, primaryNode,
+				"primary-node-server", "node", "primary", serverContainer)
 
 		// At least two Pods should be placed on the Primary and Secondary Interface
 		// on the Primary and Secondary Node in order to test all possible scenarios
@@ -121,22 +109,9 @@ var _ = Describe("test pod networking", func() {
 			Should(BeNumerically(">", 1))
 
 		By("creating server deployment on secondary node")
-		secondaryNodeDeployment = manifest.
-			NewDefaultDeploymentBuilder().
-			Container(serverContainer).
-			Replicas(maxIPPerInterface*2). // X2 so Pods are created on secondary ENI too
-			NodeName(secondaryNode.Name).
-			PodLabel("node", "secondary").
-			Name("secondary-node-server").
-			Build()
-
-		secondaryNodeDeployment, err = f.K8sResourceManagers.
-			DeploymentManager().
-			CreateAndWaitTillDeploymentIsReady(secondaryNodeDeployment, utils.DefaultDeploymentReadyTimeout)
-		Expect(err).ToNot(HaveOccurred())
-
-		interfaceToPodListOnSecondaryNode =
-			common.GetPodsOnPrimaryAndSecondaryInterface(secondaryNode, "node", "secondary", f)
+		interfaceToPodListOnSecondaryNode, secondaryNodeDeployment =
+			common.CreateDeploymentSpanningENIs(f, secondaryNode,
+				"secondary-node-server", "node", "secondary", serverContainer)
 
 		// Same reason as mentioned above
 		Expect(len(interfaceToPodListOnSecondaryNode.PodsOnPrimaryENI)).
@@ -354,6 +329,45 @@ func execNodeShell(nodeName string, command string) ([]byte, error) {
 	cmd := exec.Command("kubectl", "node-shell", nodeName, "--", "bash", "-c", command)
 	output, err := cmd.Output()
 	return output, err
+}
+
+// execNodeShellWithTimeout bounds the remote exec and captures combined output
+// so a wedged node cannot hang cleanup and failures carry their output.
+func execNodeShellWithTimeout(nodeName string, command string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", "node-shell", nodeName, "--", "bash", "-c", command)
+	output, err := cmd.CombinedOutput()
+	// Surface the context deadline: CombinedOutput reports a killed process
+	// as "signal: killed", which hides that the timeout fired.
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("%w: %v", ctx.Err(), err)
+	}
+	return output, err
+}
+
+// execNodeShellWithRetries is execNodeShellWithTimeout plus retries on any
+// failure for up to ~5 minutes. This absorbs node-shell scaffolding flakes
+// (e.g. attach racing the nsenter container startup on a busy node) as well
+// as remote commands whose success depends on the node converging. Callers
+// must therefore pass commands that are idempotent and expected to succeed.
+func execNodeShellWithRetries(nodeName string, command string, attemptTimeout time.Duration) ([]byte, error) {
+	const (
+		retryFor      = 5 * time.Minute
+		retryInterval = 10 * time.Second
+	)
+	deadline := time.Now().Add(retryFor)
+	var output []byte
+	var err error
+	for {
+		output, err = execNodeShellWithTimeout(nodeName, command, attemptTimeout)
+		if err == nil || time.Now().After(deadline) {
+			return output, err
+		}
+		fmt.Fprintf(GinkgoWriter, "node-shell on %s failed, retrying in %s: %v (output: %s)\n",
+			nodeName, retryInterval, err, output)
+		time.Sleep(retryInterval)
+	}
 }
 
 // sets requested policy in drop file and restarts udev
